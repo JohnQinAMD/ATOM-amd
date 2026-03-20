@@ -285,7 +285,8 @@ def linear_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.impl.forward(mixed_qkv, b, a, core_attn_out)
+    ret = self.impl.forward(mixed_qkv, b, a, core_attn_out, layer_name)
+    return ret
 
 
 class BaseAttention(nn.Module, ABC):
@@ -360,6 +361,7 @@ class LinearAttention(nn.Module):
         self.activation = activation
         self.layer_num = layer_num
         self.base_linear_attention = None
+        self.prefix = prefix
 
         atom_config = get_current_atom_config()
         block_size = atom_config.kv_cache_block_size
