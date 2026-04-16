@@ -181,6 +181,10 @@ class CoreManager:
                     logger.info(
                         f"{self.label}: DP rank {dp_rank} is fully initialized and ready"
                     )
+                    # Capture kv_cache_info from first rank (all ranks have same layout)
+                    if data and dp_rank == 0:
+                        self._kv_cache_info = data.get("kv_cache_info", {})
+                        self._kv_transfer_bootstrap = data.get("kv_transfer_bootstrap")
                     ready_received[dp_rank] = True
                     remaining -= 1
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
@@ -306,6 +310,16 @@ class CoreManager:
         if isinstance(seqs, BaseException):
             raise seqs
         return seqs
+
+    def get_kv_cache_info(self) -> dict:
+        """Return KV cache metadata from the first engine core (DP rank 0)."""
+        if hasattr(self, "_kv_cache_info"):
+            return self._kv_cache_info
+        return {}
+
+    def get_kv_transfer_bootstrap(self) -> dict | None:
+        """Return KV transfer bootstrap host:port if disagg mode is active."""
+        return getattr(self, "_kv_transfer_bootstrap", None)
 
     def close(self):
         if self._closed:

@@ -801,6 +801,10 @@ class Config:
     enable_tbo_decode: bool = False
     enable_low_latency: bool = False
 
+    # Disaggregated serving: "null" (normal), "prefill", or "decode"
+    disagg_mode: str = "null"
+    disagg_bootstrap_port: int = 0
+
     # only use for plugin mode
     plugin_config: Optional[PluginConfig] = None
 

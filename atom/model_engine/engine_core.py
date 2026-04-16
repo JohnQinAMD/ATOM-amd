@@ -87,6 +87,9 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            self.kv_cache_info = self.runner_mgr.call_func(
+                "get_kv_cache_info", wait_out=True
+            )
             if not config.enforce_eager:
                 # Start profiler before cudagraph capture only if mark-trace is enabled.
                 if self.profile_enbaled and self.mark_trace:
@@ -112,6 +115,42 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
+        # Disaggregated KV transfer (Phase 2)
+        self.kv_transfer_mgr = None
+        if config.disagg_mode in ("prefill", "decode"):
+            try:
+                from atom.model_engine.kv_transfer import KVCacheLayout
+                from atom.model_engine.kv_bootstrap import KVTransferManager
+
+                kvi = self.kv_cache_info
+                layout = KVCacheLayout(
+                    use_mla=kvi.get("use_mla", False),
+                    num_layers=kvi["num_layers"],
+                    num_blocks=kvi["num_blocks"],
+                    block_size=kvi["block_size"],
+                    element_size=kvi["element_size"],
+                    latent_dim=kvi.get("latent_dim", 576),
+                    num_kv_heads=kvi.get("num_kv_heads", 0),
+                    head_dim=kvi.get("head_dim", 0),
+                )
+                # Get the actual kv_cache tensor from model runner
+                kv_cache_tensor = self.runner_mgr.call_func(
+                    "get_kv_cache_tensor", wait_out=True
+                )
+                self.kv_transfer_mgr = KVTransferManager(
+                    kv_cache_tensor, layout,
+                    role=config.disagg_mode,
+                    bootstrap_port=config.disagg_bootstrap_port,
+                )
+                logger.info(
+                    f"{self.label}: KV transfer manager initialized "
+                    f"(role={config.disagg_mode}, "
+                    f"bootstrap={self.kv_transfer_mgr.bootstrap_host}:"
+                    f"{self.kv_transfer_mgr.bootstrap_port})"
+                )
+            except ImportError as e:
+                logger.warning(f"KV transfer not available: {e}")
+
         # Start input thread AFTER model is loaded so the "ready" signal
         # is sent only when the engine is truly ready to accept requests
         # self.input_thread = threading.Thread(
@@ -127,7 +166,15 @@ class EngineCore:
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
     def _send_ready_signal(self):
-        self.output_queue.put_nowait(("READY", None))
+        # Include kv_cache_info so CoreManager can expose it to LLMEngine
+        ready_data = {
+            "kv_cache_info": getattr(self, "kv_cache_info", {}),
+            "kv_transfer_bootstrap": {
+                "host": self.kv_transfer_mgr.bootstrap_host,
+                "port": self.kv_transfer_mgr.bootstrap_port,
+            } if self.kv_transfer_mgr is not None else None,
+        }
+        self.output_queue.put_nowait(("READY", ready_data))
 
     def _init_data_parallel(self, config: Config):
         pass
@@ -203,6 +250,28 @@ class EngineCore:
         except queue.Empty:
             pass
 
+        # Disagg: send KV for prefill-only sequences after postprocess
+        if self.kv_transfer_mgr is not None and finished_seqs:
+            for seq in finished_seqs:
+                if seq.disagg_mode == "prefill_only" and seq.disagg_bootstrap_info:
+                    try:
+                        binfo = seq.disagg_bootstrap_info
+                        self.kv_transfer_mgr.send_kv(
+                            src_block_ids=list(seq.block_table),
+                            decode_host=binfo["decode_host"],
+                            decode_port=binfo["decode_port"],
+                            bootstrap_room=binfo["bootstrap_room"],
+                        )
+                        logger.info(
+                            f"KV transfer sent for seq {seq.id}: "
+                            f"{len(seq.block_table)} blocks, room={binfo['bootstrap_room']}"
+                        )
+                    except Exception as e:
+                        logger.error(f"KV transfer failed for seq {seq.id}: {e}")
+                    finally:
+                        # Deallocate blocks after transfer completes
+                        self.scheduler.deallocate_seq(seq)
+
         if finished_seqs:
             self.output_queue.put_nowait(finished_seqs)
         return True
@@ -215,6 +284,32 @@ class EngineCore:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
                     return True
+                # Disagg decode: receive KV blocks before scheduling
+                if (
+                    seq.disagg_mode == "decode_only"
+                    and self.kv_transfer_mgr is not None
+                    and seq.disagg_bootstrap_info is not None
+                ):
+                    try:
+                        result = self.kv_transfer_mgr.recv_kv(
+                            self.scheduler.block_manager
+                        )
+                        dst_block_ids = result["dst_block_ids"]
+                        self.scheduler.block_manager.allocate_specific_blocks(
+                            seq, dst_block_ids
+                        )
+                        seq.num_cached_tokens = seq.num_prompt_tokens
+                        logger.info(
+                            f"KV transfer received for seq {seq.id}: "
+                            f"{len(dst_block_ids)} blocks"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"KV transfer recv failed for seq {seq.id}: {e}"
+                        )
+                        seq.status = SequenceStatus.FINISHED
+                        seq.leave_reason = "kv_transfer_failed"
+                        continue
                 recv_reqs.append(seq)
         if len(recv_reqs) > 0:
             logger.info(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
@@ -282,8 +377,8 @@ class EngineCore:
                     continue
 
                 if isinstance(item, tuple) and item[0] == "READY":
-                    # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, None))
+                    # Send READY signal with kv_cache_info and transfer bootstrap
+                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
                     socket.send(obj)
                     logger.debug(f"{self.label}: sent READY signal")
                     continue

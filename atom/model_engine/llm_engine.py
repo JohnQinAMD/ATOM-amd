@@ -105,6 +105,66 @@ class LLMEngine:
             reqs.append(req)
         self.core_mgr.add_request(reqs)
 
+    def add_prefill_only_request(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        bootstrap_info: dict,
+        stream_callback=None,
+    ):
+        """Add a prefill-only request for disaggregated serving.
+
+        After prefill completes, the engine transfers KV blocks to the decode
+        worker specified in bootstrap_info, then finishes the sequence.
+
+        Args:
+            prompt_or_tokens: Input prompt or pre-tokenized token IDs.
+            sampling_params: Sampling parameters (max_tokens ignored for prefill).
+            bootstrap_info: {decode_host, decode_port, bootstrap_room}
+            stream_callback: Optional callback for streaming prefill progress.
+        """
+        seq = self.io_processor.preprocess(
+            prompt_or_tokens, sampling_params, stream_callback=stream_callback
+        )
+        seq.disagg_mode = "prefill_only"
+        seq.disagg_bootstrap_info = bootstrap_info
+        self.core_mgr.add_request([seq])
+        return seq
+
+    def add_decode_only_request(
+        self,
+        prompt_or_tokens: str | list[int],
+        sampling_params: SamplingParams,
+        bootstrap_info: dict,
+        stream_callback=None,
+    ):
+        """Add a decode-only request for disaggregated serving.
+
+        The engine receives pre-populated KV blocks from the prefill worker
+        before scheduling the decode phase.
+
+        Args:
+            prompt_or_tokens: Input prompt or pre-tokenized token IDs.
+            sampling_params: Sampling parameters.
+            bootstrap_info: {prefill_host, prefill_port, bootstrap_room}
+            stream_callback: Optional callback for streaming decoded tokens.
+        """
+        seq = self.io_processor.preprocess(
+            prompt_or_tokens, sampling_params, stream_callback=stream_callback
+        )
+        seq.disagg_mode = "decode_only"
+        seq.disagg_bootstrap_info = bootstrap_info
+        self.core_mgr.add_request([seq])
+        return seq
+
+    def get_kv_cache_info(self) -> dict:
+        """Return KV cache layout metadata for the Dynamo registration layer."""
+        return self.core_mgr.get_kv_cache_info()
+
+    def get_kv_transfer_bootstrap(self) -> dict | None:
+        """Return KV transfer bootstrap {host, port} if disagg is active."""
+        return self.core_mgr.get_kv_transfer_bootstrap()
+
     def step(self) -> list[Sequence]:
         seqs = self.core_mgr.get_output()
         return seqs

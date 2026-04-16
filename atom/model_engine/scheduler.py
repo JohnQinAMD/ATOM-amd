@@ -519,6 +519,12 @@ class Scheduler:
 
             num_tokens = seq.num_tokens - self.mtp_k - num_rejected
             leave_reason = None
+
+            # Prefill-only sequences finish after the first token is generated
+            # (the prefill is done, KV cache is populated, blocks are kept for transfer)
+            if seq.disagg_mode == "prefill_only" and seq.num_completion_tokens >= 1:
+                leave_reason = "prefill_done"
+
             # Check if sequence ends with any stop sequence
             for stop_seq in seq.stop_token_sequences:
                 stop_len = len(stop_seq)
@@ -587,9 +593,16 @@ class Scheduler:
                     #     f"{seq.id=}, added {num}, total tokens now: {seq.num_tokens}"
                     # )
         for seq in finished_seqs:
-            self.block_manager.deallocate(seq)
+            # Prefill-only sequences keep blocks alive for KV transfer.
+            # Blocks are deallocated later by the engine core after transfer completes.
+            if seq.disagg_mode != "prefill_only":
+                self.block_manager.deallocate(seq)
             self.running.remove(seq)
         return finished_seqs
+
+    def deallocate_seq(self, seq: "Sequence"):
+        """Explicitly deallocate blocks for a sequence (used after KV transfer)."""
+        self.block_manager.deallocate(seq)
 
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""

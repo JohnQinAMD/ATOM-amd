@@ -51,6 +51,8 @@ class EngineArgs:
     method: Optional[str] = None
     num_speculative_tokens: int = 1
     mark_trace: bool = False
+    disagg_mode: str = "null"
+    disagg_bootstrap_port: int = 0
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -200,6 +202,21 @@ class EngineArgs:
             "--mark-trace",
             action="store_true",
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
+        )
+        parser.add_argument(
+            "--disagg-mode",
+            type=str,
+            default="null",
+            choices=["null", "prefill", "decode"],
+            help="Disaggregated serving mode: 'null' (normal aggregated), "
+            "'prefill' (prefill-only worker), or 'decode' (decode-only worker).",
+        )
+        parser.add_argument(
+            "--disagg-bootstrap-port",
+            type=int,
+            default=0,
+            help="Port for disaggregated KV transfer bootstrap. "
+            "0 = auto-assign. Used by both prefill and decode workers.",
         )
 
         return parser

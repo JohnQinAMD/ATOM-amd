@@ -1510,6 +1510,36 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
+    def get_kv_cache_tensor(self) -> torch.Tensor:
+        """Return the raw KV cache tensor for RDMA registration."""
+        return self.kv_cache
+
+    def get_kv_cache_info(self) -> dict:
+        """Return KV cache layout metadata for disaggregated KV transfer.
+
+        The returned dict has enough information for KVTransferOp to compute
+        byte offsets and register the kv_cache tensor for RDMA.
+        """
+        info = {
+            "kv_cache_data_ptr": self.kv_cache.data_ptr(),
+            "kv_cache_nbytes": self.kv_cache.nbytes,
+            "kv_cache_shape": list(self.kv_cache.shape),
+            "kv_cache_dtype": self.config.kv_cache_dtype,
+            "element_size": self.kv_cache.element_size(),
+            "num_blocks": self.num_physical_kvcache_blocks,
+            "block_size": self.physical_block_size,
+            "use_mla": self.use_mla,
+            "gpu_id": self.device.index if self.device.index is not None else 0,
+        }
+        if self.use_mla:
+            info["latent_dim"] = self.kv_cache.shape[-1]  # 576 for DeepSeek
+            info["num_layers"] = self.kv_cache.shape[0]
+        else:
+            info["num_kv_heads"] = self.kv_cache.shape[4] if len(self.kv_cache.shape) > 4 else 1
+            info["head_dim"] = self.kv_cache.shape[5] if len(self.kv_cache.shape) > 5 else 1
+            info["num_layers"] = self.kv_cache.shape[1]
+        return info
+
     def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         return self.config.torch_dtype, self.config.torch_dtype
 

@@ -74,6 +74,10 @@ class Sequence:
 
         # Disaggregated serving mode: None (normal), "prefill_only", "decode_only"
         self.disagg_mode: Optional[str] = None
+        # Bootstrap info for KV transfer (set by Dynamo handler before add_request)
+        # prefill_only: {decode_host, decode_port, bootstrap_room}
+        # decode_only: {prefill_host, prefill_port, bootstrap_room, dst_block_ids (filled by recv)}
+        self.disagg_bootstrap_info: Optional[dict] = None
 
         # statistics fields
         self.arrive_time = 0.0
