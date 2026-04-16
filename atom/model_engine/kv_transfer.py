@@ -105,6 +105,7 @@ class KVTransferOp:
         layout: KVCacheLayout,
         host: str = "",
         port: int = 0,
+        backend: str = "rdma",
     ):
         if not MORI_IO_AVAILABLE:
             raise ImportError(
@@ -117,7 +118,11 @@ class KVTransferOp:
 
         config = mori_cpp.IOEngineConfig(host=host, port=port)
         self._engine = IOEngine(f"kv-transfer-{id(self)}", config)
-        self._engine.create_backend(mori_cpp.BackendType.RDMA)
+        backend_type = {
+            "rdma": mori_cpp.BackendType.RDMA,
+            "xgmi": mori_cpp.BackendType.XGMI,
+        }.get(backend.lower(), mori_cpp.BackendType.RDMA)
+        self._engine.create_backend(backend_type)
 
         # Register the entire KV cache tensor for RDMA
         self._local_mem = self._engine.register_torch_tensor(kv_cache)
@@ -200,17 +205,13 @@ class KVTransferOp:
             f"{sum(sizes) / 1e6:.1f} MB total) uid={transfer_uid}"
         )
 
-        statuses = session.batch_write(
+        status = session.batch_write(
             local_offsets, remote_offsets, sizes, transfer_uid
         )
 
-        # Wait for all writes to complete
-        for i, status in enumerate(statuses):
-            status.Wait()
-            if status.Failed():
-                raise RuntimeError(
-                    f"KV transfer write {i} failed: {status.Message()}"
-                )
+        status.Wait()
+        if status.Failed():
+            raise RuntimeError(f"KV transfer write failed: {status.Message()}")
 
         logger.info(f"KV transfer send complete: uid={transfer_uid}")
 
