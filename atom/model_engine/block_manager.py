@@ -169,6 +169,35 @@ class BlockManager:
             self.free_mamba_slots.append(seq.mamba_state_slot)
             seq.mamba_state_slot = -1
 
+    def reserve_blocks(self, num_blocks: int) -> list[int]:
+        """Pre-allocate blocks without associating them with a sequence.
+
+        Used by disaggregated decode: reserve destination block IDs before
+        KV transfer fills them with data from the prefill worker.
+        """
+        if len(self.free_block_ids_set) < num_blocks:
+            raise RuntimeError(
+                f"Cannot reserve {num_blocks} blocks, only {len(self.free_block_ids_set)} free"
+            )
+        reserved = []
+        for _ in range(num_blocks):
+            block_id = self._pop_free_block()
+            self._allocate_block(block_id)
+            reserved.append(block_id)
+        return reserved
+
+    def allocate_specific_blocks(self, seq: Sequence, block_ids: list[int]):
+        """Assign pre-reserved blocks to a sequence.
+
+        Used by disaggregated decode after KV data has been transferred into
+        the reserved blocks. The blocks must already be allocated via
+        reserve_blocks().
+        """
+        assert not seq.block_table, "sequence already has blocks"
+        for block_id in block_ids:
+            assert block_id in self.used_block_ids, f"block {block_id} not reserved"
+            seq.block_table.append(block_id)
+
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)
         current_blocks = len(seq.block_table)

@@ -72,6 +72,9 @@ class Sequence:
         # save speculative tokens if is_deferred_output = False or prefill is inter
         self.spec_token_ids: np.ndarray = np.array([], dtype=np.int32)
 
+        # Disaggregated serving mode: None (normal), "prefill_only", "decode_only"
+        self.disagg_mode: Optional[str] = None
+
         # statistics fields
         self.arrive_time = 0.0
         self.first_token_time = 0.0

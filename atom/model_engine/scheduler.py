@@ -370,6 +370,16 @@ class Scheduler:
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(num_new_tokens)
 
+            # decode-only sequences skip prefill entirely: they enter
+            # self.waiting with a pre-populated block_table and all
+            # prompt tokens marked as cached. The allocator above
+            # sees num_new_tokens == 0 after caching, so the prefill
+            # batch has 0 actual tokens to compute. We mark them
+            # DECODE immediately so the next schedule() picks them
+            # up in the decode loop.
+            if seq.disagg_mode == "decode_only":
+                seq.type = SequenceType.DECODE
+
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_prefill = sum(num_scheduled_tokens_np)
 
