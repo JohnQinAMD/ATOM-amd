@@ -355,6 +355,19 @@ class Scheduler:
                 or not self.block_manager.can_allocate(seq)
             ):
                 break
+            # Decode-only seqs already have block_table populated by EngineCore's
+            # disagg KV-recv path (allocate_specific_blocks) and all prompt
+            # tokens marked as cached. They skip the prefill batch entirely
+            # and go straight into running as DECODE so the next schedule()
+            # picks them up in the decode loop. Including them in the prefill
+            # batch with 0 tokens trips model_runner's total_tokens > 0 assert.
+            if seq.disagg_mode == "decode_only" and seq.block_table:
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.DECODE
+                self.waiting.popleft()
+                self.running.append(seq)
+                continue
+
             num_seqs_prefill += 1
             self.block_manager.allocate(seq)
             # Recalculate after allocation: prefix caching may have updated
@@ -369,16 +382,6 @@ class Scheduler:
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(num_new_tokens)
-
-            # decode-only sequences skip prefill entirely: they enter
-            # self.waiting with a pre-populated block_table and all
-            # prompt tokens marked as cached. The allocator above
-            # sees num_new_tokens == 0 after caching, so the prefill
-            # batch has 0 actual tokens to compute. We mark them
-            # DECODE immediately so the next schedule() picks them
-            # up in the decode loop.
-            if seq.disagg_mode == "decode_only":
-                seq.type = SequenceType.DECODE
 
         num_scheduled_tokens_np = num_scheduled_tokens
         total_tokens_num_prefill = sum(num_scheduled_tokens_np)

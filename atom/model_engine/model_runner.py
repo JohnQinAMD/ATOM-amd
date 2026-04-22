@@ -234,7 +234,9 @@ class tokenIDProcessor:
     def get_token_locations(
         self, batch: ScheduledBatch
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-        prev_req_ids = self.prev_batch.req_ids
+        # First decode step (e.g. after disagg KV-recv) has no prev_batch; treat
+        # all current req_ids as "new" (no carryover from a previous step).
+        prev_req_ids = self.prev_batch.req_ids if self.prev_batch is not None else []
         cur_req_ids = batch.req_ids
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
@@ -362,7 +364,12 @@ class tokenIDProcessor:
             (1) prev_batch=[301], cur_batch=[0..255, 301] → Layout: [301 prefill | new | deferred]
             (2) prev_batch=[0..255], cur_batch=[0..253, 256, 257] → Layout: [deferred | new 256, 257] when conc > max_num_seq
             """
-            is_prev_prefill = self.prev_batch.total_tokens_num_prefill > 0
+            # No prev_batch on the first step (e.g. first decode step after
+            # disagg KV-recv): treat as "no previous prefill".
+            is_prev_prefill = (
+                self.prev_batch is not None
+                and self.prev_batch.total_tokens_num_prefill > 0
+            )
             new_decode_front = (
                 is_prev_prefill
                 and np.array_equal(new_curr_indices, np.arange(num_new_seqs))
@@ -1538,7 +1545,166 @@ class ModelRunner:
             info["num_kv_heads"] = self.kv_cache.shape[4] if len(self.kv_cache.shape) > 4 else 1
             info["head_dim"] = self.kv_cache.shape[5] if len(self.kv_cache.shape) > 5 else 1
             info["num_layers"] = self.kv_cache.shape[1]
+        # FP8 scale tensor metadata (non-MLA only)
+        if hasattr(self, "kv_scale") and not self.use_mla and self.config.kv_cache_dtype == "fp8":
+            info["has_kv_scale"] = True
+            info["kv_scale_data_ptr"] = self.kv_scale.data_ptr()
+            info["kv_scale_nbytes"] = self.kv_scale.nbytes
+            info["kv_scale_shape"] = list(self.kv_scale.shape)
+            info["kv_scale_element_size"] = self.kv_scale.element_size()
+        else:
+            info["has_kv_scale"] = False
         return info
+
+    # ------------------------------------------------------------------
+    # Disaggregated KV transfer — runs inside ModelRunner subprocess
+    # so it can access the kv_cache tensor directly for RDMA registration.
+    # Called via runner_mgr.call_func() from EngineCore.
+    # ------------------------------------------------------------------
+
+    def init_kv_transfer(self, disagg_mode: str, bootstrap_port: int = 0,
+                         backend: str = "rdma") -> dict:
+        """Initialize KV transfer infrastructure (called once after model load).
+
+        Creates KVTransferOp (registers kv_cache for RDMA) and the bootstrap
+        server (decode) or client (prefill) for descriptor exchange.
+
+        For multi-rank (EP+DPA), each rank uses bootstrap_port + rank to avoid
+        port conflicts. The base port (rank 0's port) is advertised to Dynamo.
+
+        Returns dict with bootstrap host:port (for decode) or empty (for prefill).
+        """
+        from atom.model_engine.kv_transfer import KVCacheLayout, MORI_IO_AVAILABLE
+        from atom.model_engine.kv_bootstrap import KVTransferManager
+
+        if not MORI_IO_AVAILABLE:
+            logger.warning("MoRI IO not available — KV transfer disabled")
+            self._kv_transfer_mgr = None
+            return {"host": "", "port": 0}
+
+        info = self.get_kv_cache_info()
+        layout = KVCacheLayout(
+            use_mla=info["use_mla"],
+            num_layers=info["num_layers"],
+            num_blocks=info["num_blocks"],
+            block_size=info["block_size"],
+            element_size=info["element_size"],
+            latent_dim=info.get("latent_dim", 576),
+            num_kv_heads=info.get("num_kv_heads", 0),
+            head_dim=info.get("head_dim", 0),
+        )
+        # Add FP8 scale metadata to layout
+        if info.get("has_kv_scale"):
+            layout.has_kv_scale = True
+            layout.scale_element_size = info["kv_scale_element_size"]
+
+        # Dynamo PrefillRouter protocol (same as SGLang/NIXL):
+        # 1. PREFILL runs bootstrap server → publishes host:port via set_disaggregated_endpoint
+        # 2. PrefillRouter reads PREFILL's endpoint (resolve_prefill_worker → get_disaggregated_endpoint)
+        # 3. PrefillRouter forwards bootstrap_info to DECODE worker
+        # 4. DECODE connects to PREFILL's server, exchanges RDMA descriptors
+        # 5. PREFILL RDMA-WRITEs KV to DECODE's GPU memory
+        #
+        # KVTransferManager role mapping:
+        #   "decode" role = has ZMQ server (for bootstrap accept)
+        #   "prefill" role = has ZMQ client (for bootstrap connect)
+        role = "decode" if disagg_mode == "prefill" else "prefill"
+        kv_scale_tensor = getattr(self, "kv_scale", None) if info.get("has_kv_scale") else None
+
+        # For multi-rank: use rank-specific bootstrap port.
+        # Rank 0 uses base port; rank N uses base_port + N.
+        rank = self.rank if hasattr(self, "rank") else 0
+        rank_port = bootstrap_port + rank if bootstrap_port > 0 else 0
+
+        self._kv_transfer_mgr = KVTransferManager(
+            self.kv_cache, layout, role=role,
+            bootstrap_port=rank_port,
+            kv_scale=kv_scale_tensor,
+        )
+
+        # The KVTransferManager's puller thread starts at __init__; no
+        # separate accept-loop call is needed.
+
+        result = {
+            "host": self._kv_transfer_mgr.bootstrap_host,
+            "port": self._kv_transfer_mgr.bootstrap_port,
+            "rank": rank,
+        }
+        logger.info(
+            f"KV transfer initialized: role={role}, rank={rank}, "
+            f"bootstrap={result['host']}:{result['port']}"
+        )
+        return result
+
+    def kv_send(self, src_block_ids: list, decode_host: str,
+                decode_port: int, bootstrap_room: int) -> bool:
+        """Prefill side: accept decode's connection on bootstrap server, then RDMA-WRITE KV.
+
+        Dynamo PrefillRouter protocol: prefill runs bootstrap server (published
+        via set_disaggregated_endpoint). Decode connects to it. They exchange
+        RDMA descriptors, then prefill RDMA-WRITEs KV blocks to decode's GPU.
+        """
+        if self._kv_transfer_mgr is None:
+            logger.error("kv_send called but KV transfer not initialized")
+            return False
+        try:
+            self._kv_transfer_mgr.serve_and_send_kv(
+                src_block_ids, bootstrap_room,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"kv_send failed: {e}")
+            return False
+
+    def kv_recv(self, prefill_host: str = "", prefill_port: int = 0,
+                dst_block_ids: list = None, bootstrap_room: int = 0,
+                timeout_ms: int = 300000) -> dict:
+        """Decode side: connect to prefill's bootstrap server and receive KV via RDMA.
+
+        Dynamo PrefillRouter protocol: prefill runs bootstrap server, decode
+        connects to it. This method connects, exchanges RDMA descriptors,
+        and waits for the RDMA writes to complete.
+        """
+        if self._kv_transfer_mgr is None:
+            logger.error("kv_recv called but KV transfer not initialized")
+            return {}
+        try:
+            if prefill_host and dst_block_ids:
+                return self._kv_transfer_mgr.connect_and_recv_kv(
+                    prefill_host, prefill_port,
+                    list(dst_block_ids), bootstrap_room,
+                    timeout_ms=timeout_ms,
+                )
+            # DP>1: non-zero ranks don't know bootstrap_room ahead of time;
+            # pop whatever arrives, let EngineCore allocate, then finalize.
+            return self._kv_transfer_mgr.recv_kv_no_alloc(timeout_ms=timeout_ms)
+        except Exception as e:
+            logger.error(f"kv_recv failed: {e}")
+            return {}
+
+    def kv_recv_finalize(self, pending: dict, dst_block_ids: list,
+                         timeout_ms: int = 300000) -> dict:
+        """Decode side: finalize KV recv after EngineCore allocated blocks.
+
+        Called from EngineCore after reserve_blocks(). Sends dst_block_ids
+        to the prefill worker and waits for RDMA transfer completion.
+        """
+        if self._kv_transfer_mgr is None:
+            logger.error("kv_recv_finalize called but KV transfer not initialized")
+            return {}
+        try:
+            return self._kv_transfer_mgr.recv_kv_finalize(
+                pending, list(dst_block_ids), timeout_ms
+            )
+        except Exception as e:
+            logger.error(f"kv_recv_finalize failed: {e}")
+            return {}
+
+    def kv_close(self) -> None:
+        """Clean up KV transfer resources."""
+        if hasattr(self, "_kv_transfer_mgr") and self._kv_transfer_mgr is not None:
+            self._kv_transfer_mgr.close()
+            self._kv_transfer_mgr = None
 
     def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         return self.config.torch_dtype, self.config.torch_dtype

@@ -56,6 +56,10 @@ class KVCacheLayout:
     # For non-MLA
     num_kv_heads: int = 0
     head_dim: int = 0
+    # FP8 scale tensor (non-MLA only)
+    # kv_scale shape: [2, num_layers, num_blocks, num_kv_heads, block_size]
+    has_kv_scale: bool = False
+    scale_element_size: int = 4  # fp32
 
     @property
     def block_bytes(self) -> int:
@@ -70,6 +74,17 @@ class KVCacheLayout:
         """Bytes per layer (all blocks)."""
         return self.num_blocks * self.block_bytes
 
+    @property
+    def scale_block_bytes(self) -> int:
+        """Bytes per single (layer, block) scale slot. Non-MLA FP8 only."""
+        # kv_scale shape: [2, num_layers, num_blocks, num_kv_heads, block_size]
+        return self.num_kv_heads * self.block_size * self.scale_element_size
+
+    @property
+    def scale_layer_bytes(self) -> int:
+        """Bytes per layer of scale data (all blocks)."""
+        return self.num_blocks * self.scale_block_bytes
+
     def block_offset(self, layer_idx: int, block_id: int) -> int:
         """Byte offset of a specific (layer, block) in the kv_cache tensor."""
         if self.use_mla:
@@ -81,12 +96,24 @@ class KVCacheLayout:
             # Return offset of K; caller adds k_v_stride for V
             return layer_idx * self.layer_bytes + block_id * self.block_bytes
 
+    def scale_block_offset(self, layer_idx: int, block_id: int) -> int:
+        """Byte offset of a (layer, block) in the kv_scale tensor."""
+        # kv_scale: [2, num_layers, num_blocks, num_kv_heads, block_size]
+        return layer_idx * self.scale_layer_bytes + block_id * self.scale_block_bytes
+
     @property
     def kv_pair_stride(self) -> int:
         """For non-MLA: byte offset between K cache and V cache (dim 0 stride)."""
         if self.use_mla:
             return 0  # MLA has K+V fused
         return self.num_layers * self.layer_bytes
+
+    @property
+    def scale_kv_pair_stride(self) -> int:
+        """For non-MLA FP8: byte offset between K_scale and V_scale (dim 0 stride)."""
+        if self.use_mla:
+            return 0
+        return self.num_layers * self.scale_layer_bytes
 
 
 class KVTransferOp:
@@ -106,6 +133,7 @@ class KVTransferOp:
         host: str = "",
         port: int = 0,
         backend: str = "rdma",
+        kv_scale: Optional[torch.Tensor] = None,
     ):
         if not MORI_IO_AVAILABLE:
             raise ImportError(
@@ -115,6 +143,7 @@ class KVTransferOp:
 
         self.layout = layout
         self.kv_cache = kv_cache
+        self.kv_scale = kv_scale
 
         config = mori_cpp.IOEngineConfig(host=host, port=port)
         self._engine = IOEngine(f"kv-transfer-{id(self)}", config)
@@ -122,14 +151,35 @@ class KVTransferOp:
             "rdma": mori_cpp.BackendType.RDMA,
             "xgmi": mori_cpp.BackendType.XGMI,
         }.get(backend.lower(), mori_cpp.BackendType.RDMA)
-        self._engine.create_backend(backend_type)
+
+        # AINIC-optimized RDMA config: 2 worker threads unlocks line rate
+        # (47.91 GB/s per NIC); 4 QPs is sufficient. See MI355X_AINIC_REPORT.md.
+        backend_config = None
+        if backend_type == mori_cpp.BackendType.RDMA:
+            backend_config = mori_cpp.RdmaBackendConfig(
+                qp_per_transfer=4,
+                num_worker_threads=2,
+                poll_cq_mode=mori_cpp.PollCqMode.POLLING,
+            )
+        self._engine.create_backend(backend_type, config=backend_config)
 
         # Register the entire KV cache tensor for RDMA
         self._local_mem = self._engine.register_torch_tensor(kv_cache)
         self._engine_desc = self._engine.get_engine_desc()
 
+        # Register FP8 scale tensor if present (non-MLA + FP8 KV cache)
+        self._local_scale_mem = None
+        if kv_scale is not None:
+            self._local_scale_mem = self._engine.register_torch_tensor(kv_scale)
+            logger.info(
+                f"KV scale tensor registered: {kv_scale.shape}, "
+                f"{kv_scale.nbytes / 1e6:.1f} MB"
+            )
+
         self._sessions: dict[str, "mori_cpp.IOEngineSession"] = {}
         self._remote_mems: dict[str, "mori_cpp.MemoryDesc"] = {}
+        self._scale_sessions: dict[str, "mori_cpp.IOEngineSession"] = {}
+        self._remote_scale_mems: dict[str, "mori_cpp.MemoryDesc"] = {}
 
         logger.info(
             f"KVTransferOp initialized: {kv_cache.shape}, "
@@ -144,8 +194,17 @@ class KVTransferOp:
     def local_mem_packed(self) -> bytes:
         return self._local_mem.pack()
 
+    @property
+    def local_scale_mem_packed(self) -> Optional[bytes]:
+        if self._local_scale_mem is not None:
+            return self._local_scale_mem.pack()
+        return None
+
     def register_peer(
-        self, peer_engine_desc_packed: bytes, peer_mem_desc_packed: bytes
+        self,
+        peer_engine_desc_packed: bytes,
+        peer_mem_desc_packed: bytes,
+        peer_scale_mem_packed: Optional[bytes] = None,
     ) -> str:
         """Register a remote peer and create a session for KV transfer."""
         peer_desc = mori_cpp.EngineDesc.unpack(peer_engine_desc_packed)
@@ -161,6 +220,18 @@ class KVTransferOp:
         peer_key = peer_desc.key
         self._sessions[peer_key] = session
         self._remote_mems[peer_key] = peer_mem
+
+        # Create scale transfer session if both sides have FP8 scales
+        if peer_scale_mem_packed is not None and self._local_scale_mem is not None:
+            peer_scale_mem = mori_cpp.MemoryDesc.unpack(peer_scale_mem_packed)
+            scale_session = self._engine.create_session(
+                self._local_scale_mem, peer_scale_mem
+            )
+            if scale_session is not None:
+                self._scale_sessions[peer_key] = scale_session
+                self._remote_scale_mems[peer_key] = peer_scale_mem
+                logger.info(f"Registered FP8 scale transfer session with {peer_key}")
+
         logger.info(f"Registered peer {peer_key} for KV transfer")
         return peer_key
 
@@ -174,7 +245,8 @@ class KVTransferOp:
         """RDMA WRITE KV blocks from local GPU to remote GPU.
 
         For each layer, writes the KV data at src_block_ids to the
-        corresponding dst_block_ids on the peer.
+        corresponding dst_block_ids on the peer. Also transfers FP8 scale
+        tensors if present (non-MLA + FP8 KV cache).
         """
         session = self._sessions[peer_key]
         layout = self.layout
@@ -213,6 +285,42 @@ class KVTransferOp:
         if status.Failed():
             raise RuntimeError(f"KV transfer write failed: {status.Message()}")
 
+        # Transfer FP8 scale tensors if present
+        if layout.has_kv_scale and peer_key in self._scale_sessions:
+            scale_session = self._scale_sessions[peer_key]
+            s_local = []
+            s_remote = []
+            s_sizes = []
+
+            for layer_idx in range(layout.num_layers):
+                for i in range(num_blocks):
+                    s_src = layout.scale_block_offset(layer_idx, src_block_ids[i])
+                    s_dst = layout.scale_block_offset(layer_idx, dst_block_ids[i])
+                    # K scale
+                    s_local.append(s_src)
+                    s_remote.append(s_dst)
+                    s_sizes.append(layout.scale_block_bytes)
+                    # V scale
+                    sv_stride = layout.scale_kv_pair_stride
+                    s_local.append(s_src + sv_stride)
+                    s_remote.append(s_dst + sv_stride)
+                    s_sizes.append(layout.scale_block_bytes)
+
+            # Use transfer_uid + 1 for scale transfer (avoids UID collision)
+            scale_uid = transfer_uid + 1
+            scale_status = scale_session.batch_write(
+                s_local, s_remote, s_sizes, scale_uid
+            )
+            scale_status.Wait()
+            if scale_status.Failed():
+                raise RuntimeError(
+                    f"KV scale transfer write failed: {scale_status.Message()}"
+                )
+            logger.info(
+                f"FP8 scale transfer complete: {len(s_sizes)} writes, "
+                f"{sum(s_sizes) / 1e6:.1f} MB, uid={scale_uid}"
+            )
+
         logger.info(f"KV transfer send complete: uid={transfer_uid}")
 
     def wait_for_transfer(
@@ -231,6 +339,13 @@ class KVTransferOp:
             self._engine.deregister_memory(self._local_mem)
         except Exception as e:
             logger.warning(f"Failed to deregister KV cache memory: {e}")
+        if self._local_scale_mem is not None:
+            try:
+                self._engine.deregister_memory(self._local_scale_mem)
+            except Exception as e:
+                logger.warning(f"Failed to deregister KV scale memory: {e}")
         self._sessions.clear()
         self._remote_mems.clear()
+        self._scale_sessions.clear()
+        self._remote_scale_mems.clear()
         logger.info("KVTransferOp closed")

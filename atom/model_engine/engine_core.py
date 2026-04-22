@@ -115,41 +115,31 @@ class EngineCore:
 
         self.scheduler = Scheduler(config)
 
-        # Disaggregated KV transfer (Phase 2)
-        self.kv_transfer_mgr = None
+        # Disaggregated KV transfer — initialized inside ModelRunner subprocess
+        # because the kv_cache tensor can't be pickled across process boundaries.
+        # We use runner_mgr.call_func("init_kv_transfer") to create the
+        # KVTransferManager in ModelRunner, which has direct access to the tensor.
+        self._disagg_mode = config.disagg_mode
+        self._kv_transfer_bootstrap = None
+        self._last_dp_kv_recv_info = None  # Track KV recv for DP broadcast
         if config.disagg_mode in ("prefill", "decode"):
-            try:
-                from atom.model_engine.kv_transfer import KVCacheLayout
-                from atom.model_engine.kv_bootstrap import KVTransferManager
-
-                kvi = self.kv_cache_info
-                layout = KVCacheLayout(
-                    use_mla=kvi.get("use_mla", False),
-                    num_layers=kvi["num_layers"],
-                    num_blocks=kvi["num_blocks"],
-                    block_size=kvi["block_size"],
-                    element_size=kvi["element_size"],
-                    latent_dim=kvi.get("latent_dim", 576),
-                    num_kv_heads=kvi.get("num_kv_heads", 0),
-                    head_dim=kvi.get("head_dim", 0),
-                )
-                # Get the actual kv_cache tensor from model runner
-                kv_cache_tensor = self.runner_mgr.call_func(
-                    "get_kv_cache_tensor", wait_out=True
-                )
-                self.kv_transfer_mgr = KVTransferManager(
-                    kv_cache_tensor, layout,
-                    role=config.disagg_mode,
-                    bootstrap_port=config.disagg_bootstrap_port,
-                )
+            bootstrap_result = self.runner_mgr.call_func(
+                "init_kv_transfer",
+                config.disagg_mode,
+                config.disagg_bootstrap_port,
+                wait_out=True,
+            )
+            if bootstrap_result:
+                self._kv_transfer_bootstrap = bootstrap_result
                 logger.info(
-                    f"{self.label}: KV transfer manager initialized "
-                    f"(role={config.disagg_mode}, "
-                    f"bootstrap={self.kv_transfer_mgr.bootstrap_host}:"
-                    f"{self.kv_transfer_mgr.bootstrap_port})"
+                    f"{self.label}: KV transfer initialized in ModelRunner: "
+                    f"mode={config.disagg_mode}, "
+                    f"bootstrap={bootstrap_result.get('host')}:{bootstrap_result.get('port')}"
                 )
-            except ImportError as e:
-                logger.warning(f"KV transfer not available: {e}")
+            else:
+                logger.warning(
+                    f"{self.label}: KV transfer init failed (MoRI unavailable?)"
+                )
 
         # Start input thread AFTER model is loaded so the "ready" signal
         # is sent only when the engine is truly ready to accept requests
@@ -169,10 +159,7 @@ class EngineCore:
         # Include kv_cache_info so CoreManager can expose it to LLMEngine
         ready_data = {
             "kv_cache_info": getattr(self, "kv_cache_info", {}),
-            "kv_transfer_bootstrap": {
-                "host": self.kv_transfer_mgr.bootstrap_host,
-                "port": self.kv_transfer_mgr.bootstrap_port,
-            } if self.kv_transfer_mgr is not None else None,
+            "kv_transfer_bootstrap": self._kv_transfer_bootstrap,
         }
         self.output_queue.put_nowait(("READY", ready_data))
 
@@ -250,22 +237,37 @@ class EngineCore:
         except queue.Empty:
             pass
 
-        # Disagg: send KV for prefill-only sequences after postprocess
-        if self.kv_transfer_mgr is not None and finished_seqs:
+        # Disagg: send KV for prefill-only sequences after postprocess.
+        # Each rank independently sends its own KV slice. For DP (multi-rank),
+        # the bootstrap_info is broadcast from rank 0. The prefill rank N
+        # connects to decode rank N at port=base_port+N.
+        if self._disagg_mode == "prefill" and finished_seqs:
             for seq in finished_seqs:
                 if seq.disagg_mode == "prefill_only" and seq.disagg_bootstrap_info:
                     try:
                         binfo = seq.disagg_bootstrap_info
-                        self.kv_transfer_mgr.send_kv(
-                            src_block_ids=list(seq.block_table),
-                            decode_host=binfo["decode_host"],
-                            decode_port=binfo["decode_port"],
-                            bootstrap_room=binfo["bootstrap_room"],
+                        # For multi-rank: adjust port for this rank
+                        decode_port = binfo["decode_port"]
+                        if hasattr(self, "dp_rank") and self.dp_rank > 0:
+                            decode_port += self.dp_rank
+                        success = self.runner_mgr.call_func(
+                            "kv_send",
+                            list(seq.block_table),
+                            binfo["decode_host"],
+                            decode_port,
+                            binfo["bootstrap_room"],
+                            wait_out=True,
                         )
-                        logger.info(
-                            f"KV transfer sent for seq {seq.id}: "
-                            f"{len(seq.block_table)} blocks, room={binfo['bootstrap_room']}"
-                        )
+                        if success:
+                            logger.info(
+                                f"KV transfer sent for seq {seq.id}: "
+                                f"{len(seq.block_table)} blocks, "
+                                f"room={binfo['bootstrap_room']}"
+                            )
+                        else:
+                            logger.error(
+                                f"KV transfer send returned False for seq {seq.id}"
+                            )
                     except Exception as e:
                         logger.error(f"KV transfer failed for seq {seq.id}: {e}")
                     finally:
@@ -284,21 +286,51 @@ class EngineCore:
                 if seq.status == SequenceStatus.EXIT_ENGINE:
                     logger.debug(f"{self.label}: input_queue get exit engine")
                     return True
-                # Disagg decode: receive KV blocks before scheduling
+                # Disagg decode: receive KV blocks before scheduling.
+                # Uses split protocol: ModelRunner accepts the prefill
+                # connection and exchanges RDMA descriptors, then EngineCore
+                # allocates blocks (it owns the block_manager), then
+                # ModelRunner finalizes the RDMA transfer.
                 if (
                     seq.disagg_mode == "decode_only"
-                    and self.kv_transfer_mgr is not None
+                    and self._disagg_mode == "decode"
                     and seq.disagg_bootstrap_info is not None
                 ):
                     try:
-                        result = self.kv_transfer_mgr.recv_kv(
-                            self.scheduler.block_manager
+                        binfo = seq.disagg_bootstrap_info
+                        prefill_host = binfo.get("bootstrap_host", "")
+                        prefill_port = binfo.get("bootstrap_port", 0)
+                        bootstrap_room = binfo.get("bootstrap_room", 0)
+
+                        # Calculate blocks needed for this prompt
+                        block_size = self.scheduler.block_manager.block_size
+                        num_blocks = (seq.num_prompt_tokens + block_size - 1) // block_size
+
+                        # Allocate blocks with MTP headroom
+                        mtp_headroom = self.scheduler.mtp_k + 1
+                        dst_block_ids = self.scheduler.block_manager.reserve_blocks_with_headroom(
+                            num_blocks, headroom=mtp_headroom,
                         )
-                        dst_block_ids = result["dst_block_ids"]
+
+                        # Decode connects to prefill's bootstrap server to receive KV
+                        recv_result = self.runner_mgr.call_func(
+                            "kv_recv",
+                            prefill_host, prefill_port,
+                            dst_block_ids, bootstrap_room,
+                            wait_out=True,
+                        )
+                        if not recv_result:
+                            raise RuntimeError("kv_recv failed")
+
                         self.scheduler.block_manager.allocate_specific_blocks(
                             seq, dst_block_ids
                         )
                         seq.num_cached_tokens = seq.num_prompt_tokens
+                        # Track for DP broadcast (non-zero ranks need to know)
+                        self._last_dp_kv_recv_info = {
+                            "num_blocks": num_blocks,
+                            "seq_id": seq.id,
+                        }
                         logger.info(
                             f"KV transfer received for seq {seq.id}: "
                             f"{len(dst_block_ids)} blocks"
@@ -429,6 +461,7 @@ class DPEngineCoreProc(EngineCore):
         # Initialize to True so first iteration reaches all_reduce
         self.engines_running = True
         self._shutting_down = False
+        self._mtp_enabled = config.speculative_config is not None
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -496,8 +529,87 @@ class DPEngineCoreProc(EngineCore):
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
+                elif self._mtp_enabled and not global_has_prefill:
+                    # After decode step with MTP: verify all DP ranks have
+                    # same batch size to prevent draft token divergence.
+                    num_running = len(self.scheduler.running)
+                    self._verify_mtp_batch_consistency(num_running)
 
             self.engines_running = global_has_unfinished
+
+    def pull_and_process_input_queue(self):
+        """Override for DP: broadcast disagg bootstrap_info from rank 0 to all ranks.
+
+        Rank 0 receives requests from Dynamo via ZMQ. For decode-only sequences,
+        rank 0's bootstrap_info is broadcast to all DP ranks so each rank
+        independently receives its KV slice from the corresponding prefill rank.
+        """
+        # Only rank 0 actually receives requests from Dynamo
+        if self.dp_rank == 0:
+            result = super().pull_and_process_input_queue()
+        else:
+            result = False
+
+        # For disagg decode: rank 0 already processed the recv in the parent
+        # call. Non-zero ranks need to participate if rank 0 did a recv.
+        if self._disagg_mode == "decode":
+            # Broadcast whether rank 0 did a KV recv this iteration
+            did_recv = [getattr(self, "_last_dp_kv_recv_info", None)]
+            try:
+                torch.distributed.broadcast_object_list(
+                    did_recv, src=0, group=self.dp_group
+                )
+            except RuntimeError:
+                return result
+
+            recv_info = did_recv[0]
+            if recv_info is not None and self.dp_rank != 0:
+                # Non-zero ranks: do their own KV recv using rank-specific
+                # bootstrap ports. The prefill side connects to port+rank.
+                try:
+                    accept_result = self.runner_mgr.call_func(
+                        "kv_recv", 0, wait_out=True,
+                    )
+                    if accept_result and "pending" in accept_result:
+                        pending = accept_result["pending"]
+                        num_blocks = accept_result["num_blocks"]
+
+                        mtp_headroom = self.scheduler.mtp_k + 1
+                        dst_block_ids = self.scheduler.block_manager.reserve_blocks_with_headroom(
+                            num_blocks, headroom=mtp_headroom,
+                        )
+
+                        self.runner_mgr.call_func(
+                            "kv_recv_finalize",
+                            pending, dst_block_ids,
+                            wait_out=True,
+                        )
+
+                        # Create and schedule the decode-only sequence on this rank
+                        # (mirroring what rank 0 did via the parent class)
+                        for seq in list(self.scheduler.waiting) + list(self.scheduler.running):
+                            if (
+                                seq.disagg_mode == "decode_only"
+                                and not hasattr(seq, "_dp_kv_received")
+                            ):
+                                self.scheduler.block_manager.allocate_specific_blocks(
+                                    seq, dst_block_ids
+                                )
+                                seq.num_cached_tokens = seq.num_prompt_tokens
+                                seq._dp_kv_received = True
+                                logger.info(
+                                    f"{self.label}: DP rank {self.dp_rank} KV recv "
+                                    f"for seq {seq.id}: {len(dst_block_ids)} blocks"
+                                )
+                                break
+                except Exception as e:
+                    logger.error(
+                        f"{self.label}: DP rank {self.dp_rank} KV recv failed: {e}"
+                    )
+            # Clear the flag for next iteration
+            self._last_dp_kv_recv_info = None
+
+        return result
 
     def _execute_dummy_batch(self):
         return self.runner_mgr.call_func("dummy_execution", wait_out=True)
@@ -563,6 +675,36 @@ class DPEngineCoreProc(EngineCore):
                 local_has_unfinished,
                 True,
             )
+
+    def _verify_mtp_batch_consistency(self, batch_size: int) -> None:
+        """Defensive check: verify all DP ranks have same batch size for MTP.
+
+        MTP draft generation runs autoregressive steps that must produce
+        identical results across DP ranks (since MoRI dispatch/combine
+        requires all ranks to participate in every MoE forward). If batch
+        sizes diverge, draft tokens will be misaligned.
+        """
+        if self._shutting_down or not self._mtp_enabled:
+            return
+        try:
+            tensor = torch.tensor([batch_size], dtype=torch.int64, device="cpu")
+            # Use MIN to detect if any rank has fewer seqs
+            min_tensor = tensor.clone()
+            torch.distributed.all_reduce(
+                min_tensor, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
+            )
+            max_tensor = tensor.clone()
+            torch.distributed.all_reduce(
+                max_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
+            )
+            if min_tensor.item() != max_tensor.item():
+                logger.warning(
+                    f"{self.label}: MTP batch size mismatch across DP ranks: "
+                    f"local={batch_size}, min={min_tensor.item()}, max={max_tensor.item()}. "
+                    f"This may cause draft token divergence."
+                )
+        except RuntimeError:
+            pass  # DP group may be torn down during shutdown
 
     def _sync_shutdown_state(self, local_should_shutdown: bool) -> bool:
         try:

@@ -186,6 +186,26 @@ class BlockManager:
             reserved.append(block_id)
         return reserved
 
+    def reserve_blocks_with_headroom(self, num_blocks: int,
+                                     headroom: int) -> list[int]:
+        """Pre-allocate blocks, ensuring at least `headroom` blocks remain free.
+
+        Used by disaggregated decode + MTP: after reserving blocks for KV
+        transfer, the first decode step needs mtp_k+1 additional blocks.
+        This method ensures those blocks are available before committing.
+
+        Raises RuntimeError if there aren't enough blocks for both the
+        transfer and the headroom.
+        """
+        total_needed = num_blocks + headroom
+        if len(self.free_block_ids_set) < total_needed:
+            raise RuntimeError(
+                f"Cannot reserve {num_blocks} blocks with {headroom} headroom: "
+                f"only {len(self.free_block_ids_set)} free "
+                f"(need {total_needed})"
+            )
+        return self.reserve_blocks(num_blocks)
+
     def allocate_specific_blocks(self, seq: Sequence, block_ids: list[int]):
         """Assign pre-reserved blocks to a sequence.
 
